@@ -1,0 +1,11 @@
+flask
+langchain-community
+langchain-chroma
+pypdf
+langchainhub
+transformers
+langchain-google-genai
+
+
+
+-e .
