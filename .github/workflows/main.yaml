@@ -11,9 +11,6 @@ permissions:
   id-token: write
   contents: read
 
-env:
-  TAG: ${{ github.sha }}
-
 jobs:
   integration:
     name: Continuous Integration
@@ -40,92 +37,61 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq unzip
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 14
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Build Docker image and set Docker tag with TAG
-        run: |
-          echo "Generated Docker tag: ${{ env.TAG }}"
-          docker build -t "${{ secrets.REPOSITORY_NAME }}" .
-          docker tag "${{ secrets.REPOSITORY_NAME }}" "${{ secrets.AWS_REGISTRY_URL }}/${{ secrets.REPOSITORY_NAME }}:${{ env.TAG }}"
-
-      - name: Debug Environment Variables
-        run: |
-          echo "AWS_REGISTRY_URL: ${{ secrets.AWS_REGISTRY_URL }}"
-          echo "Generated Docker tag:  ${{ env.TAG }}"
-
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: af-south-1
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Push Docker image to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY_NAME }}
+          IMAGE_TAG: latest
         run: |
-          aws ecr get-login-password --region af-south-1 | docker login --username AWS --password-stdin ${{ secrets.AWS_REGISTRY_URL }}
-          docker push "${{ secrets.AWS_REGISTRY_URL }}/${{ secrets.REPOSITORY_NAME }}:${{ env.TAG }}"
-
-  deploy:
-    name: Continuous Deployment
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to ECS.
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
+  Continuous-Deployment:
     needs: build-and-push-ecr-image
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v3
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: af-south-1
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: SSH into EC2 instance and deploy
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          envs: |
-            TAG=${{ env.TAG }}
-            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
-            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-            AWS_REGION=af-south-1
-          script: |
-            echo "AWS CLI version: $(aws --version)"
-            echo "Docker version: $(docker --version)"
-
-            echo "Stop the current running container if exist..."
-            docker stop container_name || true
-
-            echo "Remove the previous container..."
-            docker rm container_name || true
-
-            echo "AWS credentials set...."
-            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-            export AWS_REGION=${AWS_REGION}
-
-            echo "Logging in to ECR...."
-            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${{ secrets.AWS_REGISTRY_URL }}
-            echo "Logged in successfully..."
-
-            echo "Pulling image from ECR..."
-            docker pull "${{ secrets.AWS_REGISTRY_URL }}/${{ secrets.REPOSITORY_NAME }}:${{ env.TAG }}"
-
-            echo "Running the container..."
-            docker run -d \
-              --name container_name \
-              --env-file /path/to/env/file \
-              -p ${{ secrets.EXPOSED_PORT }}:${{ secrets.APPLICATION_PORT }} "${{ secrets.AWS_REGISTRY_URL }}/${{ secrets.REPOSITORY_NAME }}:${{ env.TAG }}"
-
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Pull latest images
+        run: |
+         docker pull ${{secrets.AWS_ECR_LOGIN_URI}}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
+         
+      - name: Stop and remove container if running
+        run: |
+         docker ps -q --filter "name=cnncls" | grep -q . && docker stop cnncls && docker rm -fv cnncls
+       
+      - name: Run Docker Image to serve users
+        run: |
+         docker run -d -p 8080:8080 --name=cnncls -e 'AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}' -e 'AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}' -e 'AWS_REGION=${{ secrets.AWS_REGION }}' -e 'GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}' ${{secrets.AWS_ECR_LOGIN_URI}}/${{ secrets.ECR_REPOSITORY_NAME }}:latest
+         
       - name: Clean previous images and containers
         run: |
-          docker system prune -f
+         docker system prune -f
